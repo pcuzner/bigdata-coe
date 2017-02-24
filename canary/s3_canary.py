@@ -368,6 +368,7 @@ def main(opts):
             now = time.time()
             if opts.time_limit:
                 if now > end_time:
+                    print("- time limit reached")
                     break
 
     except KeyboardInterrupt:
@@ -375,7 +376,7 @@ def main(opts):
         rgw.clean_up()
 
     rgw.metrics.disconnect()
-
+    print("Stopped")
     logger.info("Finished")
 
 if __name__ == "__main__":
