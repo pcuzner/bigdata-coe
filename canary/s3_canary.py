@@ -1,8 +1,10 @@
 #!/usr/bin/env python2
+"""Canary monitor that performs repeated S3 bucket and object operations
 
-# Canary monitor that performs repeated S3 bucket and object operations
-# based on the Kyle Bader's work - 
-# https://gist.github.com/mmgaggle/198004a3e88d124bed48747e8448eac3
+Based on the Kyle Bader's work -
+https://gist.github.com/mmgaggle/198004a3e88d124bed48747e8448eac3
+
+"""
 
 import logging
 import time
@@ -11,6 +13,7 @@ import os
 import string
 import random
 import binascii
+import socket
 
 from argparse import ArgumentParser
 from ConfigParser import ConfigParser
@@ -18,16 +21,112 @@ from ConfigParser import ConfigParser
 import boto
 import boto.s3.connection
 
+__author__ = "Paul Cuzner"
+__email__ = "pcuzner@redhat.com"
+__license__ = "GPL"
+__credits__ = ["Paul Cuzner", "Kyle Bader"]
+
+
+class GraphiteException(Exception):
+    pass
+
+
+class DummyMetrics(object):
+    """
+    Dummy metrics class. Methods here must mirror the real metric class
+    methods.
+    """
+
+    def connect(self):
+        pass
+
+    def send(self, msg=None):
+        pass
+
+    def disconnect(self):
+        pass
+
+
+class Graphite(object):
+    """
+    Class handling the connection and metrics sent to a Graphite/influxdb
+    plaintext target for monitoring response times.
+    """
+
+    def __init__(self, host='127.0.0.1', port=2004, prefix="ceph"):
+        """
+        Define the connection settings for graphite/influxdb
+        :param host:
+        :param port:
+        """
+        self.host = host
+        self.port = port
+        self.addr = (host, port)
+        self.socket = None
+        self.msg_prefix = "{}.{}.".format(prefix,
+                                         socket.gethostname())
+
+    def connect(self):
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.settimeout(1)
+
+        try:
+            self.socket.connect(self.addr)
+        except socket.timeout:
+            raise GraphiteException("Unable to connect - timeout")
+        except socket.gaierror:
+            raise GraphiteException("Unknown error connecting")
+        except Exception as error:
+            raise GraphiteException("Unknown exception : {}".format(error))
+
+    def send(self, message=None):
+        """
+        Send metrics to the plaintext interface port of graphite/influxdb
+        NB. A \n signifies end of message to the server - without it metrics
+            will not show up!
+        :param message: (str) text of the form "<metric_name> <metric_value>"
+        :return: None
+        """
+
+        # if the msg is only two parms, add current time
+        if len(message.split()) == 2:
+            suffix = "{}\n".format(int(time.time()))
+
+        else:
+            # assume the msg includes epoc timestamp
+            suffix = "\n"
+
+        msg = "{}{} {}\n".format(self.msg_prefix, message, suffix)
+
+        self.socket.sendall(msg)
+
+    def disconnect(self):
+
+        self.socket.shutdown(1)
+        self.socket.close()
+
+
 class RGWTest(object):
+    """
+    RGW test class providing base class operations and test_sequence method
+    that links the bucket/object operations together into a workflow
+    """
 
     test_bucket = "canary"
 
-    def __init__(self, bucket_name=None):
+    def __init__(self, bucket_name=None, runtime_opts=None):
+        """
+        Create a RGW test instance
+        :param bucket_name: (str) bucket name to use for canary testing
+        :param runtime_opts: (obj) runtime options
+        """
 
-        hostname, port = opts.rgw.split(':')
+        hostname, port = runtime_opts.rgw.split(':')
+        self.opts = runtime_opts
         self.conn = boto.connect_s3(
-                                    aws_access_key_id=opts.access_key,
-                                    aws_secret_access_key=opts.secret_key,
+                                    aws_access_key_id=self.opts.access_key,
+                                    aws_secret_access_key=self.opts.secret_key,
                                     host=hostname,
                                     port=int(port),
                                     is_secure=False,
@@ -35,26 +134,34 @@ class RGWTest(object):
                                    )
         self.canary_bucket = bucket_name if bucket_name else RGWTest.test_bucket
         self.objects = []   # list of object names in the canary bucket
-        self.obj_size = opts.object_size
+        self.obj_size = self.opts.object_size
         self.seed_contents = self._create_seed()
         self.clean_up()
+
+        if self.opts.graphite_server:
+            g_host, g_port = self.opts.graphite_server.split(":")
+            self.metrics = Graphite(host=g_host,
+                                    port=int(g_port),
+                                    prefix=self.opts.prefix)
+        else:
+            self.metrics = DummyMetrics()
+
+        self.metrics.connect()
 
     def clean_up(self):
 
         for bkt in self.conn.get_all_buckets():
             if bkt.name == self.canary_bucket:
-                logger.debug("clearing old bucket contents")
+                logger.debug("Clearing old bucket contents")
                 for key in bkt.list():
                     bkt.delete_key(key)
                 self.conn.delete_bucket(bkt.name)
 
-
     def _create_seed(self):
-
-        return binascii.b2a_hex(os.urandom(int(opts.object_size/2)))
+        return binascii.b2a_hex(os.urandom(int(self.opts.object_size/2)))
 
     def create_bucket(self):
-        logger.debug("create bucket starting")
+        logger.debug("Create bucket starting")
         start = time.time()
 
         try:
@@ -65,10 +172,12 @@ class RGWTest(object):
 
         elapsed = float(time.time() - start)
         logger.info("Test:create_bucket, secs={}".format(elapsed))
-        logger.debug("create bucket complete")
+        self.metrics.send("S3canary.BucketCreate.secs {}".format(elapsed))
+
+        logger.debug("Create bucket complete")
 
     def create_object(self, count=1):
-        logger.debug("create objects starting - for {} objects".format(count))
+        logger.debug("Create objects starting - for {} objects".format(count))
         start = time.time()
         for n in xrange(count):
             obj_name = ''.join(random.choice(string.ascii_uppercase +
@@ -81,10 +190,19 @@ class RGWTest(object):
             self.objects.append(obj_name)
 
         elapsed = float(time.time() - start)
+        obj_bytes = count*self.opts.object_size
         logger.info("Test:create_object, count={}, "
                     "bytes={}, secs={}".format(count,
-                                               (count*opts.object_size),
+                                               obj_bytes,
                                                elapsed))
+        now = int(time.time())
+        self.metrics.send("S3canary.ObjectCreate.count {} {}".format(count,
+                                                                     now))
+        self.metrics.send("S3canary.ObjectCreate.bytes {} {}".format(obj_bytes,
+                                                                     now))
+        self.metrics.send("S3canary.ObjectCreate.secs {} {}".format(elapsed,
+                                                                    now))
+
         logger.debug("create object(s) complete")
 
     def read_object(self):
@@ -98,11 +216,20 @@ class RGWTest(object):
             key.get_contents_as_string()
 
         elapsed = float(time.time() - start)
+        bytes_read = num_objects * self.opts.object_size
         logger.info("Test:read_object(s), count={}, "
-                    "bytes={}, secs={}".format(len(self.objects),
-                                               (num_objects*opts.object_size),
+                    "bytes={}, secs={}".format(num_objects,
+                                               bytes_read,
                                                elapsed,
                                                ))
+
+        now = int(time.time())
+        self.metrics.send("S3canary.ObjectRead.count {} {}".format(num_objects,
+                                                                   now))
+        self.metrics.send("S3canary.ObjectRead.bytes {} {}".format(bytes_read,
+                                                                   now))
+        self.metrics.send("S3canary.ObjectRead.secs {} {}".format(elapsed,
+                                                                  now))
 
         logger.debug("read object(s) complete")
 
@@ -121,6 +248,13 @@ class RGWTest(object):
         logger.info("Test:delete_objects, count={}, "
                     "secs={}".format(num_objects,
                                      elapsed))
+
+        now = int(time.time())
+        self.metrics.send("S3canary.ObjectDelete.count {} {}".format(num_objects,
+                                                                     now))
+        self.metrics.send("S3canary.ObjectDelete.secs {} {}".format(elapsed,
+                                                                    now))
+
         logger.debug("delete object(s) complete")
 
     def delete_bucket(self):
@@ -133,19 +267,22 @@ class RGWTest(object):
 
         elapsed = float(time.time() - start)
         logger.info("Test:delete_bucket, secs={}".format(elapsed))
+        self.metrics.send("S3canary.BucketDelete.secs {}".format(elapsed))
+
         logger.debug("delete bucket complete")
 
     def test_sequence(self):
 
         self.create_bucket()
 
-        self.create_object(count=opts.object_count)
+        self.create_object(count=self.opts.object_count)
 
         self.read_object()
 
         self.delete_object()
 
         self.delete_bucket()
+
 
 def get_opts():
 
@@ -179,14 +316,19 @@ def get_opts():
     parser.add_argument("-o", "--object-size", type=int,
                         default=65536,
                         help="object size in bytes to upload/read")
+    parser.add_argument("-g", "--graphite-server", type=str,
+                        default=None,
+                        help="Graphite server (host:port)")
+    parser.add_argument("-p", "--prefix", type=str,
+                        default="ceph",
+                        help="Prefix for the metrics name used in the log file"
+                             " and Graphite")
     parser.add_argument("-c", "--object-count", type=int,
                         default=1,
                         help="# objects to create in the canary bucket")
 
     parser.set_defaults(**defaults)
     runtime_opts = parser.parse_args()
-
-
 
     return runtime_opts
 
@@ -212,7 +354,7 @@ def main(opts):
     if opts.time_limit:
         end_time = start_time + (opts.time_limit * 60)
 
-    rgw = RGWTest()
+    rgw = RGWTest(runtime_opts=opts)
 
     now = time.time()
     print("\nRunning")
@@ -220,6 +362,7 @@ def main(opts):
         while True:
 
             rgw.test_sequence()
+
             logger.debug("waiting for next test iteration")
             time.sleep(opts.interval)
             now = time.time()
@@ -231,15 +374,17 @@ def main(opts):
         print("\nCleaning up")
         rgw.clean_up()
 
+    rgw.metrics.disconnect()
+
     logger.info("Finished")
 
 if __name__ == "__main__":
-    opts = get_opts()
 
+    opts = get_opts()
 
     logger = logging.getLogger("canary")
     logger.setLevel(logging.DEBUG)
-    handler = logging.FileHandler(filename="/var/log/query_canary.log",
+    handler = logging.FileHandler(filename="/var/log/s3_canary.log",
                                   mode="a")
 
     fmt = logging.Formatter('%(asctime)s [%(levelname)-12s] - %(message)s')
