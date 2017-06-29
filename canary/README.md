@@ -1,5 +1,5 @@
-# query_canary.py
-The query_canary script performs a set number of S3 bucket and object
+# s3_canary.py
+The s3_canary script performs a set number of S3 bucket and object
 operations. Each operation is recorded to a timestamped log file, allowing
 the elapsed time for each of the operations to be monitored over time.
 
@@ -8,14 +8,14 @@ As root
 1. define your runtime environment using the parms.conf file
 2. run the canary
 ```  
-   > python query_canary.py
+   > python s3_canary.py
 ```
 
 
 
-## query_canary supports
+## s3_canary supports
 - runtime overrides (use -h to see available options)
-- logging (activity is logged to /var/log/query_canary.log)
+- logging (activity is logged to /var/log/s3_canary.log)
 - different run times
 - different iteration durations
 - user defined object sizes
@@ -25,7 +25,7 @@ As root
 ## Example Console output  
 
 ```
-[root@rh7-client bigdata-coe]# python new_query_canary.py 
+[root@rh7-client bigdata-coe]# python s3_canary.py 
 
 Run time parameters are:
 access_key   : <bla>  
